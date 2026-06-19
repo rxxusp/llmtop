@@ -73,11 +73,16 @@ will introspect it.
 ## Install
 
 ```bash
-pip install llmtop        # once published to PyPI
-# or from source:
+# Install straight from GitHub:
+pip install git+https://github.com/rxxusp/llmtop.git
+
+# or from a clone:
 git clone https://github.com/rxxusp/llmtop && cd llmtop
 pip install -e .
 ```
+
+> Note: the bare name `llmtop` on PyPI belongs to an unrelated project, so there
+> is no `pip install llmtop` for this tool. Install from GitHub as shown above.
 
 Python 3.11+. Runtime deps: `textual`, `httpx`, `psutil`, `nvidia-ml-py`. The
 NVML binding is harmless on non-NVIDIA hosts; GPU sampling simply reports `n/a`.
