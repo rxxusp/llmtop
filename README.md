@@ -98,6 +98,102 @@ llmtop --port 9000 --port 9001   # also probe these ports
 llmtop --no-gpu             # skip NVML (non-NVIDIA hosts)
 ```
 
+### `--once`: a one-shot table
+
+`llmtop --once` prints a single human-readable snapshot and exits, handy for a
+quick check or a cron line. Real output from a DGX Spark (GB10) running vLLM,
+Ollama, and a router (lightly trimmed):
+
+```text
+llmtop snapshot: 2026-06-20 02:11:36
+
+GPUs
+   #  Name                              Util                 Mem    Temp     Power
+  --------------------------------------------------------------------------------
+   0  NVIDIA GB10                       7.0%  58.6/121.7 GB (unified)  44.0°C     11.7W
+
+System  CPU: 13.3%  RAM: 73.6/121.7 GB
+        Load avg: 1.56 0.76 0.48
+
+Engines
+  Engine                Model                        Port    PID       tok/s   reqs(r/w)   KV%    Uptime
+  ------------------------------------------------------------------------------------------------------
+  openai-compatible     n/a                          8077    n/a       n/a     n/a         n/a    n/a
+  unknown               n/a                          8080    n/a       n/a     n/a         n/a    n/a
+  vllm                  qwen36-coder                 8088    3124190   n/a     0/0         0%     31h44m
+  ollama                qwen3.6-uncensored:35b-a3b   11434   n/a       n/a     0/?         n/a    n/a
+```
+
+Note the `(unified)` memory label and the `n/a` cells: the router on `:8077` is
+API-key-gated, so its model list and metrics read as present-but-blocked rather
+than crashing the snapshot (set `LLMTOP_API_KEY` to introspect it).
+
+### `--json`: a machine-readable snapshot
+
+`llmtop --json` dumps one full discovery + metrics snapshot as JSON and exits.
+Every field the TUI shows is present, plus per-process GPU memory and raw metric
+series, so it is easy to pipe into a monitor or alert. Abridged real output:
+
+```jsonc
+{
+  "timestamp": 1781935898.71,
+  "gpus": [
+    {
+      "index": 0,
+      "name": "NVIDIA GB10",
+      "util_pct": 4.0,
+      "mem_used_bytes": 62894620672,
+      "mem_total_bytes": 130662936576,
+      "temp_c": 44.0,
+      "power_w": 10.98,
+      "power_cap_w": null,      // NOT_SUPPORTED on GB10 -> null, not a crash
+      "clock_sm_mhz": 2418,
+      "clock_mem_mhz": null,    // NOT_SUPPORTED on GB10
+      "fan_pct": null,          // NOT_SUPPORTED on GB10
+      "throttled": false,
+      "unified_memory": true,
+      "procs": [
+        { "pid": 3124886, "name": "VLLM::EngineCore", "gpu_mem_bytes": 61884448768 },
+        { "pid": 3330298, "name": "firefox",          "gpu_mem_bytes":   353464320 }
+      ],
+      "note": "unified memory (shared with system RAM)",
+      "error": null
+    }
+  ],
+  "system": {
+    "cpu_pct": 10.3, "cpu_count": 20,
+    "ram_used_bytes": 79101251584, "ram_total_bytes": 130662936576,
+    "load_avg": [1.56, 0.76, 0.48]
+  },
+  "engines": [
+    {
+      "engine_type": "openai-compatible",
+      "name": "OpenAI-compatible",
+      "base_url": "http://127.0.0.1:8077",
+      "port": 8077,
+      "models": [],
+      "is_router": false,
+      "signals": ["port-scan", "v1/models→401"],
+      "last_error": "requires API key (set LLMTOP_API_KEY to introspect)"
+    },
+    {
+      "engine_type": "vllm",
+      "name": "vLLM",
+      "port": 8088,
+      "models": [{ "id": "qwen36-coder" }],
+      "metrics": { "requests_running": 0, "kv_cache_pct": 0.0 }
+    }
+    // ... ollama, unknown ...
+  ],
+  "events": ["Engine appeared: vLLM (vllm) at http://127.0.0.1:8088"],
+  "errors": []
+}
+```
+
+(The JSON is strict JSON; the `//` comments above are only annotations for the
+README.) The `procs` array is where per-engine GPU attribution comes from on
+unified-memory boxes; see [GPU support](#gpu-support) below.
+
 ### Keybindings
 
 | Key | Action |
@@ -109,6 +205,54 @@ llmtop --no-gpu             # skip NVML (non-NVIDIA hosts)
 | `Enter` | toggle the detail pane for the selected engine |
 | `r` | force a full re-discovery on the next poll |
 | `?` | help |
+
+## GPU support
+
+GPU telemetry comes from NVML (`nvidia-ml-py`). On a normal discrete-GPU host
+all fields populate as you would expect: utilization, memory used/total,
+temperature, power + power cap, SM/memory clocks, and fan. `llmtop` keeps
+sparkline history per GPU and color-codes pressure.
+
+`llmtop` is built to never crash on a field NVML refuses to answer. Each metric
+is read in its own guarded call, so a `NOT_SUPPORTED` on one field degrades that
+field to `n/a`/`null` and leaves the rest intact.
+
+### NVIDIA GB10 / DGX Spark (unified memory)
+
+The GB10 (DGX Spark) and Jetson/Orin-class parts share a single pool of memory
+between CPU and GPU, and several NVML queries return `NOT_SUPPORTED` there.
+`llmtop` handles this specifically rather than reporting bogus numbers:
+
+- **Memory.** `nvmlDeviceGetMemoryInfo` is `NOT_SUPPORTED` on GB10, so there is
+  no separate "VRAM total/used" to read. `llmtop` detects this (both by the
+  device name and by the failing call), flags the GPU as `unified_memory`, and
+  uses the system memory total for capacity. The memory figure is labelled
+  `(unified)` in the TUI and carries a `note: "unified memory (shared with
+  system RAM)"` in `--json` so consumers know it is shared, not dedicated VRAM.
+- **Power cap, memory clock, fan.** `nvmlDeviceGetEnforcedPowerLimit`,
+  `nvmlDeviceGetClockInfo(NVML_CLOCK_MEM)`, and `nvmlDeviceGetFanSpeed` are all
+  `NOT_SUPPORTED` on GB10. Those fields degrade to `null`/`n/a`
+  (`power_cap_w`, `clock_mem_mhz`, `fan_pct`) while util, temperature, power
+  usage, and SM clock still report normally.
+- **Per-engine GPU memory.** Because there is no per-device VRAM readout,
+  `llmtop` derives per-engine usage from NVML's per-process compute memory
+  (`nvmlDeviceGetComputeRunningProcesses`) and attributes it by walking the
+  process tree: each engine PID plus its `psutil` child processes are summed, so
+  a vLLM worker that runs as a child (or under a different user) is still
+  counted against its engine. Used memory for the whole unified pool is the sum
+  of those per-process figures, falling back to `psutil.virtual_memory().used`
+  when no process data is available. Processes that cannot be tied to a known
+  engine are classified by their process tree instead.
+
+The net effect on a DGX Spark: you see real GPU util/temp/power, a correctly
+labelled unified-memory figure, and per-engine memory attribution, with the
+genuinely unavailable knobs shown as `n/a` instead of fabricated zeros.
+
+### Non-NVIDIA / no GPU
+
+The NVML binding is harmless on hosts without an NVIDIA GPU; sampling simply
+reports `n/a`. Pass `--no-gpu` to skip NVML entirely. Engine discovery and
+serving metrics work the same with or without a GPU.
 
 ## Writing an adapter
 
